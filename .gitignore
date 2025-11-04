@@ -4,6 +4,7 @@ build/
 *.dylib
 .DS_Store
 *.pcap
+*.pcapng
 captures/
 .vscode/
 .idea/

@@ -1,4 +1,5 @@
 #include "p2p_client.hpp"
+
 #include <chrono>
 #include <iostream>
 #include <thread>
@@ -47,25 +48,58 @@ void P2PClient::registerWithRendezvous() {
 
     Logger::info("Registered with rendezvous server");
 
-    auto [response, sender_info] = rendezvous_socket_->receivefrom();
-    auto [cmd, data] = Protocol::parse(response);
+    rendezvous_socket_->setNonBlocking(false);
 
-    if (cmd == Command::REGISTER) {
-        Logger::info("Registration confirmed: " + data);
-    } else {
-        Logger::warning("Unexpected response from rendezvous: " + response);
+    auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool response_received = false;
+
+    while (!response_received && std::chrono::steady_clock::now() < timeout) {
+        try {
+            auto [response, sender_info] = rendezvous_socket_->receivefrom();
+            auto [cmd, data] = Protocol::parse(response);
+
+            if (cmd == Command::REGISTER) {
+                Logger::info("Registration confirmed: " + data);
+                response_received = true;
+            } else if (cmd == Command::PEER_INFO) {
+                auto [peer_ip, peer_port] = Protocol::parsePeerInfo(data);
+                peer_ip_ = peer_ip;
+                peer_port_ = peer_port;
+                Logger::info("Received peer info early: " + peer_ip_ + ":" +
+                             std::to_string(peer_port_));
+                response_received = true;
+            } else {
+                Logger::warning("Unexpected response from rendezvous: " + response);
+                response_received = true;
+            }
+        } catch (const std::runtime_error& e) {
+            if (std::chrono::steady_clock::now() >= timeout) {
+                throw std::runtime_error("Timeout waiting for registration response");
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+    }
+
+    if (!response_received) {
+        throw std::runtime_error("Timeout waiting for registration response");
     }
 }
 
 void P2PClient::waitForPeerInfo() {
+    if (!peer_ip_.empty() && peer_port_ != 0) {
+        Logger::info("Peer info already received: " + peer_ip_ + ":" + std::to_string(peer_port_));
+        return;
+    }
+
     Logger::info("Waiting for peer information from rendezvous server...");
+
+    rendezvous_socket_->setNonBlocking(true);
 
     bool peer_info_received = false;
     auto timeout = std::chrono::steady_clock::now() + std::chrono::seconds(30);
 
     while (!peer_info_received && std::chrono::steady_clock::now() < timeout) {
         try {
-            rendezvous_socket_->setNonBlocking(true);
             auto [response, sender_info] = rendezvous_socket_->receivefrom();
             auto [cmd, data] = Protocol::parse(response);
 
@@ -78,9 +112,18 @@ void P2PClient::waitForPeerInfo() {
                 break;
             }
         } catch (const std::runtime_error& e) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::string error_msg = e.what();
+            if (error_msg.find("Failed to receive") != std::string::npos ||
+                error_msg.find("Resource temporarily unavailable") != std::string::npos ||
+                error_msg.find("would block") != std::string::npos) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } else {
+                throw;
+            }
         }
     }
+
+    rendezvous_socket_->setNonBlocking(false);
 
     if (!peer_info_received) {
         throw std::runtime_error("Timeout waiting for peer information");
@@ -113,7 +156,7 @@ void P2PClient::sendHolePunchPackets(const std::string& peer_ip, uint16_t peer_p
         try {
             p2p_socket_->sendto(punch_msg, peer_ip, peer_port);
             Logger::debug("Sent hole punch packet " + std::to_string(i + 1) + "/" +
-                         std::to_string(count));
+                          std::to_string(count));
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         } catch (const std::exception& e) {
             Logger::error("Failed to send hole punch packet: " + std::string(e.what()));
@@ -140,7 +183,15 @@ bool P2PClient::establishConnection(const std::string& peer_ip, uint16_t peer_po
                 return true;
             }
         } catch (const std::runtime_error& e) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::string error_msg = e.what();
+            if (error_msg.find("Failed to receive") != std::string::npos ||
+                error_msg.find("Resource temporarily unavailable") != std::string::npos ||
+                error_msg.find("would block") != std::string::npos) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            } else {
+                Logger::debug("Error in establishConnection: " + error_msg);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
     }
 
@@ -150,7 +201,7 @@ bool P2PClient::establishConnection(const std::string& peer_ip, uint16_t peer_po
 void P2PClient::startP2PCommunication(const std::string& peer_ip, uint16_t peer_port) {
     Logger::info("Starting P2P communication with " + peer_ip + ":" + std::to_string(peer_port));
 
-    p2p_socket_->setNonBlocking(false);
+    p2p_socket_->setNonBlocking(true);
 
     receiver_thread_ = std::thread(&P2PClient::handleIncomingMessages, this);
 
@@ -196,12 +247,24 @@ void P2PClient::handleIncomingMessages() {
                 }
             }
         } catch (const std::runtime_error& e) {
-            if (running_) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::string error_msg = e.what();
+            if (error_msg.find("Failed to receive") != std::string::npos ||
+                error_msg.find("Resource temporarily unavailable") != std::string::npos ||
+                error_msg.find("would block") != std::string::npos) {
+                if (running_) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            } else {
+                Logger::error("Unexpected error in handleIncomingMessages: " + error_msg);
+                if (running_) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
             }
         } catch (const std::exception& e) {
             Logger::error("Error receiving message: " + std::string(e.what()));
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (running_) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
         }
     }
 }
@@ -242,4 +305,3 @@ void P2PClient::sendMessages() {
 }
 
 }  // namespace network
-
