@@ -1,0 +1,10 @@
+build/
+*.o
+*.so
+*.dylib
+.DS_Store
+*.pcap
+captures/
+.vscode/
+.idea/
+
