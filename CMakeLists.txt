@@ -13,7 +13,6 @@ set(SOURCES
     src/rendezvous/rendezvous_server.cpp
     src/p2p/p2p_client.cpp
 )
-
 add_executable(p2p_app ${SOURCES})
 
 set_target_properties(p2p_app PROPERTIES
